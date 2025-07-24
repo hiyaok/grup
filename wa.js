@@ -5,8 +5,9 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
+const crypto = require('crypto'); 
 //
-global.crypto = require('crypto').webcrypto;
+global.crypto = crypto;
 
 // Konfigurasi
 const BOT_TOKEN = '8081458964:AAG_FR3DwQEFbU3KJA5R8oI8rnM6fjK3VV0'; // Ganti dengan token bot Telegram Anda
