@@ -79,6 +79,39 @@ async function saveSettings(settings) {
     await fs.writeFile(SETTINGS_FILE, JSON.stringify(settings, null, 2));
 }
 
+// Fungsi untuk menampilkan main menu
+function getMainMenuKeyboard() {
+    return {
+        inline_keyboard: [
+            [
+                { text: '➕ Tambah Grup', callback_data: 'add_group' },
+                { text: '➖ Hapus Grup', callback_data: 'remove_group' }
+            ],
+            [
+                { text: '📋 List Grup', callback_data: 'list_groups' },
+                { text: '🆔 Cek ID', callback_data: 'check_id' }
+            ],
+            [
+                { text: '👤 Add Admin', callback_data: 'add_admin' },
+                { text: '📄 List Admin', callback_data: 'list_admins' }
+            ],
+            [
+                { text: '❌ Remove Admin', callback_data: 'remove_admin' },
+                { text: '🛡 On/Off Proteksi', callback_data: 'toggle_protection' }
+            ]
+        ]
+    };
+}
+
+// Fungsi untuk keyboard kembali
+function getBackKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'back_to_main' }]
+        ]
+    };
+}
+
 // Pattern detector untuk bahasa Indonesia - DIPERBANYAK
 const riskyPatterns = [
     // Kata kasar umum
@@ -148,6 +181,9 @@ const userRateLimit = new Map();
 const imageHashes = new Map();
 const forwardCache = new Map();
 let lockdownGroups = new Set();
+
+// Storage untuk pending operations
+const pendingOperations = new Map();
 
 // Fungsi untuk hash gambar
 function hashImage(buffer) {
@@ -270,6 +306,13 @@ async function autoCleanup() {
             userRateLimit.set(userId, filtered);
         }
     }
+    
+    // Cleanup pending operations
+    for (const [userId, data] of pendingOperations.entries()) {
+        if (now - data.timestamp > 300000) { // 5 menit
+            pendingOperations.delete(userId);
+        }
+    }
 }
 
 // Auto cleanup setiap 5 menit
@@ -281,12 +324,35 @@ async function isBotAdmin(userId) {
     return userId === admins.mainAdmin || admins.admins.includes(userId);
 }
 
+// Fungsi untuk mendapatkan username atau nama user
+async function getUserInfo(userId) {
+    try {
+        const userInfo = await bot.getChat(userId);
+        return {
+            name: userInfo.first_name + (userInfo.last_name ? ` ${userInfo.last_name}` : ''),
+            username: userInfo.username ? `@${userInfo.username}` : null
+        };
+    } catch (error) {
+        return {
+            name: 'Unknown User',
+            username: null
+        };
+    }
+}
+
 // Handler untuk pesan
 bot.on('message', async (msg) => {
     try {
         const chatId = msg.chat.id;
         const userId = msg.from.id;
         const settings = await getSettings();
+        
+        // Cek pending operation
+        const pending = pendingOperations.get(userId);
+        if (pending && msg.chat.type === 'private') {
+            await handlePendingOperation(userId, msg, pending);
+            return;
+        }
         
         // Skip jika proteksi tidak aktif
         if (!settings.protectionEnabled) return;
@@ -382,6 +448,142 @@ bot.on('message', async (msg) => {
     }
 });
 
+// Handler untuk pending operations
+async function handlePendingOperation(userId, msg, pending) {
+    const chatId = msg.chat.id;
+    
+    if (msg.text === '/cancel') {
+        pendingOperations.delete(userId);
+        await bot.sendMessage(chatId, '❌ Operasi dibatalkan.', {
+            reply_markup: getBackKeyboard()
+        });
+        return;
+    }
+    
+    switch (pending.type) {
+        case 'add_group':
+            const groupIds = msg.text.split('\n').map(id => id.trim()).filter(id => id);
+            const groups = await getGroups();
+            let added = 0;
+            
+            for (const groupId of groupIds) {
+                if (!groups.includes(groupId)) {
+                    groups.push(groupId);
+                    added++;
+                }
+            }
+            
+            await saveGroups(groups);
+            await bot.sendMessage(chatId, 
+                `✅ Berhasil menambahkan ${added} grup baru.`,
+                { 
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
+                }
+            );
+            break;
+            
+        case 'remove_group':
+            const groupId = msg.text.trim();
+            let groupsList = await getGroups();
+            const index = groupsList.indexOf(groupId);
+            
+            if (index > -1) {
+                groupsList.splice(index, 1);
+                await saveGroups(groupsList);
+                await bot.sendMessage(chatId, '✅ Grup berhasil dihapus.', {
+                    reply_markup: getBackKeyboard()
+                });
+            } else {
+                await bot.sendMessage(chatId, '❌ Grup tidak ditemukan.', {
+                    reply_markup: getBackKeyboard()
+                });
+            }
+            break;
+            
+        case 'add_admin':
+            const newAdminId = parseInt(msg.text.trim());
+            if (isNaN(newAdminId)) {
+                await bot.sendMessage(chatId, '❌ ID tidak valid. Masukkan ID berupa angka.', {
+                    reply_markup: getBackKeyboard()
+                });
+                break;
+            }
+            
+            const adminData = await getAdmins();
+            
+            if (newAdminId === adminData.mainAdmin) {
+                await bot.sendMessage(chatId, '❌ User tersebut adalah admin utama.', {
+                    reply_markup: getBackKeyboard()
+                });
+            } else if (!adminData.admins.includes(newAdminId)) {
+                adminData.admins.push(newAdminId);
+                await saveAdmins(adminData);
+                
+                // Dapatkan info user
+                const userInfo = await getUserInfo(newAdminId);
+                await bot.sendMessage(chatId, 
+                    `✅ Admin baru berhasil ditambahkan!\n\n` +
+                    `👤 Nama: ${userInfo.name}\n` +
+                    `🆔 ID: <code>${newAdminId}</code>` +
+                    (userInfo.username ? `\n📱 Username: ${userInfo.username}` : ''),
+                    { 
+                        parse_mode: 'HTML',
+                        reply_markup: getBackKeyboard()
+                    }
+                );
+            } else {
+                await bot.sendMessage(chatId, '❌ User sudah menjadi admin.', {
+                    reply_markup: getBackKeyboard()
+                });
+            }
+            break;
+            
+        case 'remove_admin':
+            const removeAdminId = parseInt(msg.text.trim());
+            if (isNaN(removeAdminId)) {
+                await bot.sendMessage(chatId, '❌ ID tidak valid. Masukkan ID berupa angka.', {
+                    reply_markup: getBackKeyboard()
+                });
+                break;
+            }
+            
+            const adminsData = await getAdmins();
+            
+            if (removeAdminId === adminsData.mainAdmin) {
+                await bot.sendMessage(chatId, '❌ Tidak dapat menghapus admin utama.', {
+                    reply_markup: getBackKeyboard()
+                });
+            } else {
+                const adminIndex = adminsData.admins.indexOf(removeAdminId);
+                if (adminIndex > -1) {
+                    adminsData.admins.splice(adminIndex, 1);
+                    await saveAdmins(adminsData);
+                    
+                    // Dapatkan info user
+                    const userInfo = await getUserInfo(removeAdminId);
+                    await bot.sendMessage(chatId, 
+                        `✅ Admin berhasil dihapus!\n\n` +
+                        `👤 Nama: ${userInfo.name}\n` +
+                        `🆔 ID: <code>${removeAdminId}</code>` +
+                        (userInfo.username ? `\n📱 Username: ${userInfo.username}` : ''),
+                        { 
+                            parse_mode: 'HTML',
+                            reply_markup: getBackKeyboard()
+                        }
+                    );
+                } else {
+                    await bot.sendMessage(chatId, '❌ User bukan admin.', {
+                        reply_markup: getBackKeyboard()
+                    });
+                }
+            }
+            break;
+    }
+    
+    pendingOperations.delete(userId);
+}
+
 // Handler untuk bot ditambahkan ke grup
 bot.on('new_chat_members', async (msg) => {
     const chatId = msg.chat.id;
@@ -463,23 +665,6 @@ bot.onText(/\/start/, async (msg) => {
         return;
     }
     
-    const keyboard = {
-        inline_keyboard: [
-            [
-                { text: '➕ Tambah Grup', callback_data: 'add_group' },
-                { text: '➖ Hapus Grup', callback_data: 'remove_group' }
-            ],
-            [
-                { text: '📋 List Grup', callback_data: 'list_groups' },
-                { text: '🆔 Cek ID', callback_data: 'check_id' }
-            ],
-            [
-                { text: '👤 Add Admin', callback_data: 'add_admin' },
-                { text: '🛡 On/Off Proteksi', callback_data: 'toggle_protection' }
-            ]
-        ]
-    };
-    
     await bot.sendMessage(chatId,
         '🤖 <b>Bot Keamanan Grup Premium</b>\n\n' +
         '🛡 Fitur Keamanan:\n' +
@@ -492,7 +677,7 @@ bot.onText(/\/start/, async (msg) => {
         'Pilih menu di bawah:',
         { 
             parse_mode: 'HTML',
-            reply_markup: keyboard
+            reply_markup: getMainMenuKeyboard()
         }
     );
 });
@@ -536,6 +721,26 @@ bot.on('callback_query', async (query) => {
     }
     
     switch (data) {
+        case 'back_to_main':
+            await bot.editMessageText(
+                '🤖 <b>Bot Keamanan Grup Premium</b>\n\n' +
+                '🛡 Fitur Keamanan:\n' +
+                '• Deteksi konten berbahaya AI\n' +
+                '• Rate limiting canggih\n' +
+                '• Filter duplikat pesan & gambar\n' +
+                '• Analisis forward berbahaya\n' +
+                '• Mode lockdown otomatis\n' +
+                '• Auto-recovery & cleanup\n\n' +
+                'Pilih menu di bawah:',
+                {
+                    chat_id: chatId,
+                    message_id: query.message.message_id,
+                    parse_mode: 'HTML',
+                    reply_markup: getMainMenuKeyboard()
+                }
+            );
+            break;
+            
         case 'add_group':
             await bot.editMessageText(
                 '➕ <b>Tambah Grup</b>\n\n' +
@@ -548,31 +753,14 @@ bot.on('callback_query', async (query) => {
                 {
                     chat_id: chatId,
                     message_id: query.message.message_id,
-                    parse_mode: 'HTML'
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
                 }
             );
-            bot.once('message', async (msg) => {
-                if (msg.text === '/cancel') {
-                    await bot.sendMessage(chatId, '❌ Operasi dibatalkan.');
-                    return;
-                }
-                
-                const groupIds = msg.text.split('\n').map(id => id.trim()).filter(id => id);
-                const groups = await getGroups();
-                let added = 0;
-                
-                for (const groupId of groupIds) {
-                    if (!groups.includes(groupId)) {
-                        groups.push(groupId);
-                        added++;
-                    }
-                }
-                
-                await saveGroups(groups);
-                await bot.sendMessage(chatId, 
-                    `✅ Berhasil menambahkan ${added} grup baru.`,
-                    { parse_mode: 'HTML' }
-                );
+            
+            pendingOperations.set(userId, {
+                type: 'add_group',
+                timestamp: Date.now()
             });
             break;
             
@@ -584,26 +772,14 @@ bot.on('callback_query', async (query) => {
                 {
                     chat_id: chatId,
                     message_id: query.message.message_id,
-                    parse_mode: 'HTML'
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
                 }
             );
-            bot.once('message', async (msg) => {
-                if (msg.text === '/cancel') {
-                    await bot.sendMessage(chatId, '❌ Operasi dibatalkan.');
-                    return;
-                }
-                
-                const groupId = msg.text.trim();
-                let groups = await getGroups();
-                const index = groups.indexOf(groupId);
-                
-                if (index > -1) {
-                    groups.splice(index, 1);
-                    await saveGroups(groups);
-                    await bot.sendMessage(chatId, '✅ Grup berhasil dihapus.');
-                } else {
-                    await bot.sendMessage(chatId, '❌ Grup tidak ditemukan.');
-                }
+            
+            pendingOperations.set(userId, {
+                type: 'remove_group',
+                timestamp: Date.now()
             });
             break;
             
@@ -617,12 +793,14 @@ bot.on('callback_query', async (query) => {
                 for (let i = 0; i < groups.length; i++) {
                     groupList += `${i + 1}. <code>${groups[i]}</code>\n`;
                 }
+                groupList += `\n<b>Total:</b> ${groups.length} grup`;
             }
             
             await bot.editMessageText(groupList, {
                 chat_id: chatId,
                 message_id: query.message.message_id,
-                parse_mode: 'HTML'
+                parse_mode: 'HTML',
+                reply_markup: getBackKeyboard()
             });
             break;
             
@@ -636,29 +814,99 @@ bot.on('callback_query', async (query) => {
             await bot.editMessageText(
                 '👤 <b>Tambah Admin</b>\n\n' +
                 'Kirim ID user yang ingin dijadikan admin.\n\n' +
+                'Contoh: <code>123456789</code>\n\n' +
                 '/cancel untuk membatalkan',
                 {
                     chat_id: chatId,
                     message_id: query.message.message_id,
-                    parse_mode: 'HTML'
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
                 }
             );
-            bot.once('message', async (msg) => {
-                if (msg.text === '/cancel') {
-                    await bot.sendMessage(chatId, '❌ Operasi dibatalkan.');
-                    return;
+            
+            pendingOperations.set(userId, {
+                type: 'add_admin',
+                timestamp: Date.now()
+            });
+            break;
+            
+        case 'list_admins':
+            const adminsList = await getAdmins();
+            let adminText = '📄 <b>Daftar Admin Bot:</b>\n\n';
+            
+            // Admin utama
+            const mainAdminInfo = await getUserInfo(adminsList.mainAdmin);
+            adminText += `👑 <b>Admin Utama:</b>\n`;
+            adminText += `👤 ${mainAdminInfo.name}\n`;
+            adminText += `🆔 <code>${adminsList.mainAdmin}</code>\n`;
+            if (mainAdminInfo.username) {
+                adminText += `📱 ${mainAdminInfo.username}\n`;
+            }
+            
+            // Admin biasa
+            if (adminsList.admins.length > 0) {
+                adminText += `\n👥 <b>Admin Lainnya:</b>\n\n`;
+                for (let i = 0; i < adminsList.admins.length; i++) {
+                    const adminInfo = await getUserInfo(adminsList.admins[i]);
+                    adminText += `${i + 1}. ${adminInfo.name}\n`;
+                    adminText += `🆔 <code>${adminsList.admins[i]}</code>\n`;
+                    if (adminInfo.username) {
+                        adminText += `📱 ${adminInfo.username}\n`;
+                    }
+                    adminText += '\n';
                 }
-                
-                const newAdminId = parseInt(msg.text.trim());
-                const adminData = await getAdmins();
-                
-                if (!adminData.admins.includes(newAdminId)) {
-                    adminData.admins.push(newAdminId);
-                    await saveAdmins(adminData);
-                    await bot.sendMessage(chatId, '✅ Admin baru berhasil ditambahkan.');
-                } else {
-                    await bot.sendMessage(chatId, '❌ User sudah menjadi admin.');
+            } else {
+                adminText += '\n<i>Tidak ada admin lain</i>';
+            }
+            
+            adminText += `\n<b>Total Admin:</b> ${adminsList.admins.length + 1}`;
+            
+            await bot.editMessageText(adminText, {
+                chat_id: chatId,
+                message_id: query.message.message_id,
+                parse_mode: 'HTML',
+                reply_markup: getBackKeyboard()
+            });
+            break;
+            
+        case 'remove_admin':
+            const adminsData = await getAdmins();
+            if (userId !== adminsData.mainAdmin) {
+                await bot.answerCallbackQuery(query.id, '❌ Hanya admin utama yang bisa menghapus admin!');
+                return;
+            }
+            
+            if (adminsData.admins.length === 0) {
+                await bot.editMessageText(
+                    '❌ <b>Tidak Ada Admin untuk Dihapus</b>\n\n' +
+                    'Saat ini tidak ada admin lain selain admin utama.',
+                    {
+                        chat_id: chatId,
+                        message_id: query.message.message_id,
+                        parse_mode: 'HTML',
+                        reply_markup: getBackKeyboard()
+                    }
+                );
+                break;
+            }
+            
+            await bot.editMessageText(
+                '❌ <b>Hapus Admin</b>\n\n' +
+                'Kirim ID admin yang ingin dihapus.\n\n' +
+                'Contoh: <code>123456789</code>\n\n' +
+                '⚠️ <i>Hanya admin biasa yang bisa dihapus, bukan admin utama.</i>\n\n' +
+                '/cancel untuk membatalkan',
+                {
+                    chat_id: chatId,
+                    message_id: query.message.message_id,
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
                 }
+            );
+            
+            pendingOperations.set(userId, {
+                type: 'remove_admin',
+                timestamp: Date.now()
             });
             break;
             
@@ -669,11 +917,15 @@ bot.on('callback_query', async (query) => {
             
             await bot.editMessageText(
                 `🛡 <b>Status Proteksi:</b> ${settings.protectionEnabled ? '✅ AKTIF' : '❌ NONAKTIF'}\n\n` +
-                `Proteksi telah ${settings.protectionEnabled ? 'diaktifkan' : 'dinonaktifkan'} untuk semua grup.`,
+                `Proteksi telah ${settings.protectionEnabled ? 'diaktifkan' : 'dinonaktifkan'} untuk semua grup.\n\n` +
+                `${settings.protectionEnabled ? 
+                    '🔒 Semua fitur keamanan sekarang aktif dan melindungi grup-grup terdaftar.' : 
+                    '🔓 Fitur keamanan dinonaktifkan sementara. Bot tidak akan memproses pesan grup.'}`,
                 {
                     chat_id: chatId,
                     message_id: query.message.message_id,
-                    parse_mode: 'HTML'
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
                 }
             );
             break;
@@ -684,11 +936,16 @@ bot.on('callback_query', async (query) => {
                 'Gunakan perintah /id di:\n' +
                 '• Chat pribadi untuk melihat ID Anda\n' +
                 '• Grup untuk melihat ID grup\n' +
-                '• Reply pesan user untuk melihat ID mereka',
+                '• Reply pesan user untuk melihat ID mereka\n\n' +
+                '💡 <b>Tips:</b>\n' +
+                '• ID grup biasanya dimulai dengan -100\n' +
+                '• ID user adalah angka positif\n' +
+                '• Salin ID dengan tap & hold pada kode',
                 {
                     chat_id: chatId,
                     message_id: query.message.message_id,
-                    parse_mode: 'HTML'
+                    parse_mode: 'HTML',
+                    reply_markup: getBackKeyboard()
                 }
             );
             break;
