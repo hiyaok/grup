@@ -162,13 +162,16 @@ bot.command('connect', async (ctx) => {
     // Variable untuk menyimpan message ID QR dan interval
     let qrMessageId = null;
     let qrInterval = null;
+    let retryCount = 0;
+    const maxRetries = 3;
     
     // Inisialisasi QR state
     qrState.set(userId, {
         currentQR: null,
         lastQR: null,
         messageId: null,
-        updateInProgress: false
+        updateInProgress: false,
+        errorCount: 0
     });
     
     try {
@@ -185,7 +188,7 @@ bot.command('connect', async (ctx) => {
         const { version, isLatest } = await fetchLatestBaileysVersion();
         console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`);
         
-        // Buat koneksi WhatsApp
+        // Buat koneksi WhatsApp dengan error handling yang lebih baik
         const sock = makeWASocket({
             version,
             auth: {
@@ -200,9 +203,13 @@ bot.command('connect', async (ctx) => {
             syncFullHistory: false,
             msgRetryCounterCache,
             defaultQueryTimeoutMs: undefined,
+            // Tambahan untuk stabilitas
+            connectTimeoutMs: 60000,
+            qrTimeout: 30000,
+            keepAliveIntervalMs: 10000,
         });
         
-        // Update QR dengan debouncing
+        // Update QR dengan debouncing dan error handling
         qrInterval = setInterval(async () => {
             const state = qrState.get(userId);
             if (!state || !connectingUsers.has(userId)) return;
@@ -214,13 +221,19 @@ bot.command('connect', async (ctx) => {
                 qrState.set(userId, state);
                 
                 try {
+                    // Validasi QR code sebelum generate
+                    if (!state.currentQR || typeof state.currentQR !== 'string' || state.currentQR.length < 10) {
+                        throw new Error('Invalid QR code data');
+                    }
+                    
                     const qrBuffer = await qrcode.toBuffer(state.currentQR, { 
                         width: 300,
                         margin: 2,
                         color: {
                             dark: '#000000',
                             light: '#FFFFFF'
-                        }
+                        },
+                        errorCorrectionLevel: 'M'
                     });
                     
                     const caption = '📱 Scan QR code ini dengan WhatsApp Anda:\n\n' +
@@ -228,10 +241,11 @@ bot.command('connect', async (ctx) => {
                                   '2. Ketuk Menu atau Setelan > Perangkat tertaut\n' +
                                   '3. Ketuk "Tautkan perangkat"\n' +
                                   '4. Scan QR code ini\n\n' +
-                                  '⏱️ QR akan diperbarui otomatis';
+                                  '⏱️ QR akan diperbarui otomatis\n' +
+                                  '⚠️ Jika QR tidak muncul dengan benar, klik Batal dan coba lagi';
                     
                     if (state.messageId) {
-                        // Hapus pesan QR lama sebelum kirim yang baru (untuk QR kedaluarsa)
+                        // Hapus pesan QR lama
                         try {
                             await ctx.telegram.deleteMessage(ctx.chat.id, state.messageId);
                         } catch (e) {
@@ -252,26 +266,41 @@ bot.command('connect', async (ctx) => {
                     
                     state.messageId = message.message_id;
                     state.updateInProgress = false;
+                    state.errorCount = 0;
                     qrState.set(userId, state);
                     
                 } catch (error) {
                     console.error('Error updating QR:', error);
                     state.updateInProgress = false;
+                    state.errorCount = (state.errorCount || 0) + 1;
                     qrState.set(userId, state);
+                    
+                    // Jika error terjadi beberapa kali, notify user
+                    if (state.errorCount >= 3) {
+                        await ctx.reply('⚠️ Terjadi kesalahan saat generate QR Code. Silakan klik batal dan coba lagi.');
+                        // Reset error count
+                        state.errorCount = 0;
+                        qrState.set(userId, state);
+                    }
                 }
             }
-        }, 2000); // Cek setiap 2 detik untuk mengurangi kemungkinan double send
+        }, 2000); // Cek setiap 2 detik
         
-        // Handle connection update
+        // Handle connection update dengan error handling yang lebih baik
         sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
+            const { connection, lastDisconnect, qr, isOnline, isNewLogin } = update;
             
             if (qr) {
                 console.log('QR Code received');
                 const state = qrState.get(userId);
                 if (state) {
-                    state.currentQR = qr;
-                    qrState.set(userId, state);
+                    // Validasi QR sebelum simpan
+                    if (qr && typeof qr === 'string' && qr.length > 10) {
+                        state.currentQR = qr;
+                        qrState.set(userId, state);
+                    } else {
+                        console.error('Invalid QR received:', qr);
+                    }
                 }
             }
             
@@ -282,7 +311,9 @@ bot.command('connect', async (ctx) => {
                     qrInterval = null;
                 }
                 
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                
                 console.log('connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
                 
                 connectingUsers.delete(userId);
@@ -301,13 +332,40 @@ bot.command('connect', async (ctx) => {
                 // Cleanup QR state
                 qrState.delete(userId);
                 
-                if (shouldReconnect) {
-                    ctx.reply('🔄 Koneksi terputus. Gunakan /connect untuk menghubungkan kembali.');
-                } else {
-                    ctx.reply('📱 Logout berhasil.');
+                // Handle different disconnect reasons
+                let message = '';
+                switch (statusCode) {
+                    case DisconnectReason.badSession:
+                        message = '❌ Session bermasalah. Silakan /logout dan /connect lagi.';
+                        break;
+                    case DisconnectReason.connectionClosed:
+                        message = '🔄 Koneksi terputus. Silakan /connect untuk menghubungkan kembali.';
+                        break;
+                    case DisconnectReason.connectionLost:
+                        message = '📶 Koneksi internet terputus. Silakan /connect lagi setelah koneksi stabil.';
+                        break;
+                    case DisconnectReason.connectionReplaced:
+                        message = '⚠️ WhatsApp dibuka di perangkat lain. Silakan /connect lagi.';
+                        break;
+                    case DisconnectReason.loggedOut:
+                        message = '📱 Logout berhasil.';
+                        break;
+                    case DisconnectReason.restartRequired:
+                        message = '🔄 Perlu restart. Silakan /connect lagi.';
+                        break;
+                    case DisconnectReason.timedOut:
+                        message = '⏱️ Timeout. QR Code kedaluwarsa. Silakan /connect lagi.';
+                        break;
+                    default:
+                        message = shouldReconnect ? 
+                            '🔄 Koneksi terputus. Gunakan /connect untuk menghubungkan kembali.' :
+                            '📱 Logout berhasil.';
                 }
+                
+                ctx.reply(message);
+                
             } else if (connection === 'open') {
-                console.log('Connection opened');
+                console.log('Connection opened successfully');
                 
                 // Clear interval
                 if (qrInterval) {
@@ -344,6 +402,8 @@ bot.command('connect', async (ctx) => {
                 } catch (e) {
                     await ctx.reply('✅ Berhasil terhubung dengan WhatsApp!');
                 }
+            } else if (connection === 'connecting') {
+                console.log('Connecting to WhatsApp...');
             }
         });
         
@@ -353,6 +413,11 @@ bot.command('connect', async (ctx) => {
         // Handle messages (untuk debugging)
         sock.ev.on('messages.upsert', async (m) => {
             console.log('Received message');
+        });
+        
+        // Error handling untuk socket
+        sock.ev.on('error', (error) => {
+            console.error('Socket error:', error);
         });
         
         // Send waiting message
@@ -368,7 +433,18 @@ bot.command('connect', async (ctx) => {
             clearInterval(qrInterval);
         }
         
-        ctx.reply('❌ Terjadi kesalahan saat menghubungkan dengan WhatsApp.\nError: ' + error.message);
+        let errorMessage = '❌ Terjadi kesalahan saat menghubungkan dengan WhatsApp.\n';
+        
+        // Handle specific errors
+        if (error.message.includes('ENOTFOUND')) {
+            errorMessage += 'Masalah koneksi internet. Pastikan koneksi internet stabil.';
+        } else if (error.message.includes('ETIMEDOUT')) {
+            errorMessage += 'Koneksi timeout. Silakan coba lagi.';
+        } else {
+            errorMessage += 'Error: ' + error.message;
+        }
+        
+        ctx.reply(errorMessage);
     }
 });
 
@@ -438,8 +514,15 @@ bot.command('namagrup', async (ctx) => {
     try {
         ctx.reply('🔄 Mengambil daftar grup...');
         
-        // Dapatkan semua chat
-        const chats = await sock.groupFetchAllParticipating();
+        // Dapatkan semua chat dengan error handling
+        let chats;
+        try {
+            chats = await sock.groupFetchAllParticipating();
+        } catch (error) {
+            console.error('Error fetching groups:', error);
+            return ctx.reply('❌ Gagal mengambil daftar grup. Pastikan koneksi WhatsApp stabil.');
+        }
+        
         const groups = Object.values(chats).filter(chat => chat.id.endsWith('@g.us'));
         
         if (groups.length === 0) {
@@ -637,22 +720,19 @@ bot.on('text', async (ctx) => {
         }
         
         try {
-            // Format pesan lengkap
-            const fullMessage = `📋 *Permintaan Unban Grup*\n\n` +
-                              `Dari: ${sock.user?.id.split(':')[0] || 'Unknown'}\n\n` +
-                              `*Grup yang diminta untuk di-unban:*\n${session.groupList}\n\n` +
-                              `*Pesan:*\n${text}`;
-            
-            // Kirim ke WhatsApp support
+            // Kirim HANYA pesan tinjau ke WhatsApp support
+            // Tidak include list grup dalam pesan yang dikirim
             await sock.sendMessage(WHATSAPP_SUPPORT, { 
-                text: fullMessage 
+                text: text  // Hanya kirim teks tinjau yang diinput user
             });
             
+            // Konfirmasi ke user dengan menampilkan apa yang dikirim
             ctx.reply(
                 '✅ Pesan berhasil dikirim ke WhatsApp support untuk ditinjau!\n\n' +
                 '📋 Grup yang diminta untuk di-unban:\n' +
                 `${session.groupList}\n\n` +
-                'Status: Menunggu tinjauan\n\n' +
+                '📨 Pesan yang dikirim ke support:\n' +
+                `"${text}"\n\n` +
                 '⏱️ Biasanya proses tinjauan memakan waktu 24-48 jam.'
             );
             
@@ -661,7 +741,19 @@ bot.on('text', async (ctx) => {
             
         } catch (error) {
             console.error('Error sending message:', error);
-            ctx.reply('❌ Gagal mengirim pesan. Error: ' + error.message);
+            
+            let errorMessage = '❌ Gagal mengirim pesan. ';
+            
+            // Handle specific errors
+            if (error.message.includes('not authorized')) {
+                errorMessage += 'WhatsApp belum terverifikasi atau nomor support tidak valid.';
+            } else if (error.message.includes('Connection')) {
+                errorMessage += 'Koneksi WhatsApp terputus. Silakan /connect lagi.';
+            } else {
+                errorMessage += 'Error: ' + error.message;
+            }
+            
+            ctx.reply(errorMessage);
             userSessions.delete(userId);
         }
     }
