@@ -11,7 +11,7 @@ const NodeCache = require('node-cache');
 global.crypto = crypto;
 
 // Konfigurasi
-const BOT_TOKEN = '8081458964:AAG_FR3DwQEFbU3KJA5R8oI8rnM6fjK3VV0'; // Token bot Telegram
+const BOT_TOKEN = '7562673828:AAH30pGum6eDekjt_DSY3zKLiP0Udwj9kOo'; // Token bot Telegram
 const WHATSAPP_SUPPORT = '15517868423@s.whatsapp.net'; // WhatsApp support number
 const ADMINS_FILE = path.join(__dirname, 'admins.json');
 const PREMIUM_FILE = path.join(__dirname, 'premium.json');
